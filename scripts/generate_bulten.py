@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 HaberZ Bülten Audio Generator
-Fetches top 10 Sabah Gündem headlines and generates a TTS bulletin via OpenAI.
-Output: audio-output/bulten_morning.mp3  (run before 17:00 Istanbul)
-         audio-output/bulten_evening.mp3  (run at/after 17:00 Istanbul)
+Two-step pipeline:
+  1. GPT-4o-mini writes a professional TV news anchor script (~5 min) from RSS headlines.
+  2. OpenAI TTS (onyx voice) converts the script to audio.
+Output: audio-output/bulten_morning.mp3 or audio-output/bulten_evening.mp3
 """
 
 import datetime
@@ -18,22 +19,21 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 RSS_URL = "https://www.sabah.com.tr/rss/gundem.xml"
 OUTPUT_DIR = "audio-output"
 
-# Phrases that appear in RSS feeds but should never be spoken aloud
+_HTML = re.compile(r"<[^>]+>")
 _JUNK = re.compile(
     r"(Son Dakika[!:]?|SON DAKİKA[!:]?|Devamın?ı? için tıklayınız\.?|"
     r"Haberin devamı(nı)? için tıklayınız\.?|Devamını oku\.?|"
     r"Haber için tıklayınız\.?|>> ?Tıklayınız\.?|tıklayınız\.?|"
-    r"https?://\S+|\[.*?\]|\(.*?\))",
+    r"https?://\S+|\[.*?\])",
     re.IGNORECASE,
 )
-_HTML = re.compile(r"<[^>]+>")
-_WHITESPACE = re.compile(r"\s{2,}")
+_SPACE = re.compile(r"\s{2,}")
 
 
 def clean(text: str) -> str:
     text = _HTML.sub(" ", text)
     text = _JUNK.sub(" ", text)
-    text = _WHITESPACE.sub(" ", text)
+    text = _SPACE.sub(" ", text)
     return text.strip(" .")
 
 
@@ -48,36 +48,72 @@ def fetch_headlines(url: str) -> list[dict]:
         desc = clean(item.findtext("description", ""))
         if title:
             items.append({"title": title, "description": desc})
-        if len(items) >= 10:
+        if len(items) >= 7:  # 7 stories fits comfortably in 5 minutes
             break
     return items
 
 
-def build_script(items: list[dict], label: str) -> str:
-    parts = [
-        f"HaberZ {label} Haber Bülteni.",
-        "İşte günün öne çıkan haberleri.",
-    ]
-    for item in items:
-        segment = item["title"] + "."
-        desc = item["description"]
-        if len(desc) > 20:
-            # First two sentences only — keep it concise
-            sentences = [s.strip() for s in desc.split(". ") if s.strip()]
-            snippet = ". ".join(sentences[:2])
-            if snippet and not snippet.endswith("."):
-                snippet += "."
-            segment += " " + snippet
-        parts.append(segment)
-    parts.append("HaberZ günlük bültenini dinlediğiniz için teşekkürler.")
-    return " ".join(parts)
+def generate_script(headlines: list[dict], label: str) -> str:
+    """Ask GPT-4o-mini to write a professional Turkish TV news anchor script."""
+
+    stories = ""
+    for i, h in enumerate(headlines, 1):
+        stories += f"{i}. Başlık: {h['title']}\n"
+        if h["description"] and len(h["description"]) > 20:
+            stories += f"   Detay: {h['description']}\n"
+        stories += "\n"
+
+    system_prompt = (
+        "Sen deneyimli bir Türk televizyonu haber sunucususun. "
+        "Sana verilen haberleri, canlı TV ana haber bülteni gibi sun. "
+        "Profesyonel, akıcı ve ilgi çekici bir dil kullan. "
+        "Her haberi kısa ve öz tut — dinleyicinin dikkatini kaybetmemesi için. "
+        "Haberler arasında 'Öte yandan...', 'Bu arada...', 'Gündemin bir diğer önemli konusu...', "
+        "'Ekonomi gündeminden...', 'Siyasi arenada...' gibi doğal geçişler kullan. "
+        "Sadece sunucu metnini yaz — başlık, madde işareti veya açıklama ekleme. "
+        "Toplam metin 650 kelimeyi geçmemeli (yaklaşık 5 dakika)."
+    )
+
+    user_prompt = (
+        f"HaberZ {label} Bülteni için aşağıdaki haberleri TV haber sunucusu gibi sun:\n\n"
+        f"{stories}"
+        f"Bültene 'HaberZ {label} Bülteni'nde hoş geldiniz.' diye başla ve "
+        f"'HaberZ ile haberdar kalın, iyi günler.' diye bitir."
+    )
+
+    payload = json.dumps({
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 1200,
+        "temperature": 0.7,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        result = json.loads(r.read())
+
+    return result["choices"][0]["message"]["content"].strip()
 
 
 def call_tts(text: str) -> bytes:
-    payload = json.dumps(
-        {"model": "tts-1-hd", "input": text, "voice": "onyx",
-         "response_format": "mp3", "speed": 1.0}
-    ).encode()
+    payload = json.dumps({
+        "model": "tts-1-hd",
+        "input": text,
+        "voice": "onyx",
+        "response_format": "mp3",
+        "speed": 1.0,
+    }).encode()
+
     req = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
         data=payload,
@@ -98,24 +134,25 @@ def main() -> None:
     istanbul = datetime.timezone(datetime.timedelta(hours=3))
     now = datetime.datetime.now(istanbul)
 
-    if now.hour >= 17:
-        label, filename = "Akşam", "bulten_evening.mp3"
-    else:
-        label, filename = "Sabah", "bulten_morning.mp3"
+    label = "Akşam" if now.hour >= 17 else "Sabah"
+    filename = "bulten_evening.mp3" if now.hour >= 17 else "bulten_morning.mp3"
 
     print(f"[{now.strftime('%H:%M')} Istanbul] Generating {label} bulletin → {filename}")
 
     headlines = fetch_headlines(RSS_URL)
     if not headlines:
-        print("ERROR: No headlines fetched from RSS.", file=sys.stderr)
+        print("ERROR: No headlines fetched.", file=sys.stderr)
         sys.exit(1)
     print(f"Fetched {len(headlines)} headlines.")
 
-    script = build_script(headlines, label)
-    print(f"Script preview: {script[:180]}…")
+    print("Generating news anchor script via GPT-4o-mini...")
+    script = generate_script(headlines, label)
+    word_count = len(script.split())
+    print(f"Script: {word_count} words\n---\n{script[:300]}…\n---")
 
+    print("Converting to speech via OpenAI TTS...")
     audio = call_tts(script)
-    print(f"Audio size: {len(audio):,} bytes")
+    print(f"Audio: {len(audio):,} bytes")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out = os.path.join(OUTPUT_DIR, filename)
