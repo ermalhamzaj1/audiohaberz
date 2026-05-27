@@ -74,11 +74,15 @@ def generate_script(headlines: list[dict], label: str) -> str:
         "Toplam metin 650 kelimeyi geçmemeli (yaklaşık 5 dakika)."
     )
 
+    greeting = "Günaydın" if label == "Sabah" else "İyi akşamlar"
+    farewell = "İyi günler" if label == "Sabah" else "İyi akşamlar"
+
     user_prompt = (
         f"HaberZ {label} Bülteni için aşağıdaki haberleri TV haber sunucusu gibi sun:\n\n"
         f"{stories}"
-        f"Bültene 'HaberZ {label} Bülteni'nde hoş geldiniz.' diye başla ve "
-        f"'HaberZ ile haberdar kalın, iyi günler.' diye bitir."
+        f"Bültene tam olarak şu cümleyle başla: "
+        f"'{greeting}, HaberZ ile günün en önemli gelişmelerine hoş geldiniz.' "
+        f"Bitişte: 'HaberZ ile haberdar kalmaya devam edin. {farewell}.'"
     )
 
     payload = json.dumps({
